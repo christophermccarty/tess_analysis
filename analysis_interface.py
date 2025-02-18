@@ -479,6 +479,7 @@ class TESSAnalyzerUI:
         self.centroid_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
 
+
 if __name__ == "__main__":
     root = tk.Tk()
     ui = TESSAnalyzerUI(root)
