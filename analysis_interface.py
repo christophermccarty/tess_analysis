@@ -7,77 +7,11 @@ from astropy.stats import sigma_clip
 import tkinter as tk
 from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-
-# Function to process the TESS Target Pixel File (TPF) for a given TIC ID and plot the phase-folded light curve
-def process_tess_file(tpf_path, ui):
-    try:
-        plt.close('all')  # Close any existing figures at start
-        
-        # Load the TESS Target Pixel File (TPF)
-        tpf = lk.TessTargetPixelFile(tpf_path)
-
-        # Generate the light curve using the pipeline mask
-        lc = tpf.to_lightcurve(aperture_mask=tpf.pipeline_mask)
-
-        # Flatten the light curve to remove long-term trends
-        flat_lc = lc.flatten()
-
-        # Perform sigma clipping to remove outliers (3-sigma is typical)
-        clipped_lc = flat_lc[sigma_clip(flat_lc.flux, sigma=5).mask == False]
-
-        # Compute a moving average of the flux values using pandas' rolling method
-        window_size = 200  # Larger window size for smoother average (adjust this value for desired smoothness)
-        df = pd.DataFrame({'flux': clipped_lc.flux})
-        moving_avg = df['flux'].rolling(window=window_size, center=True).mean()
-
-        # Search for transits using BLS with a fixed period range
-        period = np.linspace(0.5, 10, 10000)  # Define a fixed period range (e.g., 0.5 to 10 days)
-        bls = clipped_lc.to_periodogram(method='bls', period=period, frequency_factor=500)
-
-        # Extract the period of the most prominent transit
-        planet_x_period = bls.period_at_max_power
-        print(f"Period at max power: {planet_x_period}")
-        planet_x_t0 = bls.transit_time_at_max_power.value
-
-        # Call before phase-folding
-        centroid_analysis(tpf, clipped_lc, ui)
-
-        # Phase-fold the light curve
-        folded_lc = clipped_lc.fold(period=planet_x_period, epoch_time=planet_x_t0)
-
-        # Call after phase-folding the light curve
-        odd_even_transit_analysis(folded_lc, planet_x_period.value)
-
-        # Call after phase-folding the light curve
-        calculate_snr(folded_lc, planet_x_period.value)
-
-        # Call after identifying the transit period and folding the light curve
-        transit_timing_variation_analysis(folded_lc, planet_x_period.value, ui)
-
-        # Instead of plt.show(), use the UI to plot
-        ui.plot_lightcurve(folded_lc, moving_avg)
-
-        return folded_lc
-
-    except Exception as e:
-        plt.close('all')
-        print(f"Error processing {tpf_path}: {e}")
-    finally:
-        plt.close('all')  # Ensure all figures are closed
-
-def odd_even_transit_analysis(folded_lc, period):
-    odd_transits = folded_lc[(folded_lc.time.value % (2 * period)) < period]
-    even_transits = folded_lc[(folded_lc.time.value % (2 * period)) >= period]
-
-    # Calculate median depth of odd and even transits
-    odd_depth = np.median(odd_transits.flux)
-    even_depth = np.median(even_transits.flux)
-
-    print(f"Odd Transit Depth: {odd_depth}")
-    print(f"Even Transit Depth: {even_depth}")
-
-    if np.abs(odd_depth - even_depth) > 0.01:  # Example threshold
-        print("Warning: Significant difference between odd and even transit depths. Possible false positive.")
+import multiprocessing as mp
+from functools import partial
+from scipy.optimize import curve_fit
+from scipy import stats
+from matplotlib.widgets import RectangleSelector
 
 
 def centroid_analysis(tpf, clipped_lc, ui):
@@ -131,99 +65,52 @@ def centroid_analysis(tpf, clipped_lc, ui):
             print("Warning: Unable to calculate centroid shift due to invalid values")
 
 
-def transit_timing_variation_analysis(folded_lc, planet_period, ui):
-    """
-    Analyze Transit Timing Variations (TTVs) by extracting individual transit times
-    and calculating their deviations from a linear ephemeris.
-
-    Parameters:
-    - folded_lc: lightkurve.LightCurve object that has been folded on the planet's period.
-    - planet_period: float, the orbital period of the planet in the same units as folded_lc.time.
-
-    Returns:
-    - None. Displays a plot of TTVs.
-    """
-    # Validate inputs
-    if not hasattr(folded_lc, 'time') or not hasattr(folded_lc, 'flux'):
-        raise AttributeError("folded_lc must have 'time' and 'flux' attributes.")
-
-    if not isinstance(planet_period, (int, float)):
-        raise ValueError("planet_period must be a numerical value (int or float).")
-
-    # Extract time and flux as unitless arrays
-    time = folded_lc.time.value  # Assuming time is in days; adjust if different
-    flux = folded_lc.flux.value  # Flux as unitless
-
-    # Calculate epochs using floor division to assign each time point to an epoch
-    epochs = time // planet_period
-    unique_epochs = np.unique(epochs)
-
-    transit_times = []
-    for epoch in unique_epochs:
-        transit_mask = (epochs == epoch)
-        if np.any(transit_mask):
-            # Extract the times corresponding to the current epoch
-            current_times = time[transit_mask]
-            # Calculate the median transit time for this epoch
-            transit_time = np.median(current_times)
-            transit_times.append(transit_time)
-
-    # Convert transit_times to a NumPy array for numerical operations
-    transit_times = np.array(transit_times)
-
-    # Check if at least two transits are present to calculate deviations
-    if len(transit_times) < 2:
-        print("Insufficient number of transits to calculate timing variations.")
-        return
-
-    # Calculate expected transit times based on a linear ephemeris
-    expected_times = transit_times[0] + np.arange(len(transit_times)) * planet_period
-
-    # Calculate deviations (TTVs)
-    deviations = transit_times - expected_times
-
-    # Instead of plt.show(), use the UI to plot
-    ui.plot_ttv(unique_epochs, deviations)
-
-
 def calculate_snr(folded_lc, planet_period):
     try:
         # Use a wider window for transit detection
-        transit_duration = 0.2 * planet_period  # Increased from 0.1
+        transit_duration = 0.2 * planet_period
         in_transit = (np.abs(folded_lc.time.value) < transit_duration)
         out_of_transit = ~in_transit
 
         # Require minimum number of points for reliable calculation
-        if np.sum(in_transit) < 10 or np.sum(out_of_transit) < 10:
-            print("Warning: Insufficient points for reliable SNR calculation")
+        min_points = 20
+        if np.sum(in_transit) < min_points or np.sum(out_of_transit) < min_points:
+            print(f"Warning: Insufficient points for reliable SNR calculation (minimum {min_points} required)")
             return None
 
-        # Calculate transit depth using robust statistics
-        in_transit_flux = folded_lc.flux[in_transit]
-        out_transit_flux = folded_lc.flux[out_of_transit]
+        # Handle masked arrays explicitly to avoid partition warning
+        in_transit_flux = np.ma.filled(folded_lc.flux[in_transit], fill_value=np.nan)
+        out_transit_flux = np.ma.filled(folded_lc.flux[out_of_transit], fill_value=np.nan)
         
-        # Remove outliers before calculating depth
-        in_transit_flux = sigma_clip(in_transit_flux, sigma=3)
-        out_transit_flux = sigma_clip(out_transit_flux, sigma=3)
+        # Remove NaN values before calculations
+        in_transit_flux = in_transit_flux[~np.isnan(in_transit_flux)]
+        out_transit_flux = out_transit_flux[~np.isnan(out_transit_flux)]
         
-        transit_depth = np.nanmedian(in_transit_flux)
-        baseline = np.nanmedian(out_transit_flux)
+        # Use robust statistics for better noise estimation
+        transit_depth = np.median(in_transit_flux)
+        baseline = np.median(out_transit_flux)
         
-        # Calculate noise using out-of-transit scatter
-        noise = np.nanstd(out_transit_flux)
+        # Use median absolute deviation for noise estimation
+        noise = np.median(np.abs(out_transit_flux - baseline)) * 1.4826  # Scale factor for MAD
         
         # Calculate SNR using relative depth
         depth = np.abs(baseline - transit_depth)
         snr = depth / noise if noise > 0 else 0
         
+        # Print detailed diagnostics
+        print(f"\nTransit Analysis Results:")
+        print(f"Number of in-transit points: {len(in_transit_flux)}")
+        print(f"Number of out-of-transit points: {len(out_transit_flux)}")
         print(f"Transit Depth: {depth:.6f}")
         print(f"Baseline Flux: {baseline:.6f}")
         print(f"Noise Level: {noise:.6f}")
-        print(f"Signal-to-Noise Ratio (SNR): {snr:.6f}")
+        print(f"Signal-to-Noise Ratio (SNR): {snr:.2f}")
 
         if snr < 7:
             print("Warning: Low SNR, transit signal may not be reliable.")
-            
+            if snr < 1:
+                print("Signal is likely noise - consider skipping this period.")
+        
         return snr
 
     except Exception as e:
@@ -309,82 +196,112 @@ class TESSAnalyzerUI:
         self.root = root
         self.root.title("TESS Data Analyzer")
         
-        # Set fixed window size
-        self.root.geometry("1024x768")  # Width x Height
-        self.root.resizable(False, False)  # Disable window resizing
+        # Set minimum window size
+        self.root.minsize(800, 600)
         
-        # Create control panel frame with fixed height
-        self.control_frame = ttk.Frame(root)
-        self.control_frame.pack(fill=tk.X, padx=5, pady=5)
+        # Initialize dragging state
+        self.is_dragging = False
+        self.rect_artist = None
         
-        # Add file load controls
-        ttk.Label(self.control_frame, text="Load Local File:").grid(row=0, column=0, padx=5, pady=5)
-        self.file_entry = ttk.Entry(self.control_frame, width=40)
-        self.file_entry.grid(row=0, column=1, padx=5, pady=5)
-        self.browse_button = ttk.Button(self.control_frame, text="Browse", command=self.browse_file)
-        self.browse_button.grid(row=0, column=2, padx=5, pady=5)
-        self.load_button = ttk.Button(self.control_frame, text="Load", command=self.load_local_file)
-        self.load_button.grid(row=0, column=3, padx=5, pady=5)
+        # Create main container
+        self.main_container = ttk.Frame(root)
+        self.main_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Add TIC ID controls
-        ttk.Label(self.control_frame, text="Search by TIC ID:").grid(row=1, column=0, padx=5, pady=5)
-        self.tic_entry = ttk.Entry(self.control_frame, width=40)
-        self.tic_entry.grid(row=1, column=1, padx=5, pady=5)
-        self.search_button = ttk.Button(self.control_frame, text="Search & Download", command=self.search_tic)
-        self.search_button.grid(row=1, column=2, columnspan=2, padx=5, pady=5)
+        # Create top frame for input controls
+        self.input_frame = ttk.Frame(self.main_container)
+        self.input_frame.pack(fill=tk.X, pady=(0, 5))
+        
+        # Add file input controls
+        self.setup_file_input()
+        
+        # Add TIC search controls
+        self.setup_tic_search()
         
         # Create status label
-        self.status_label = ttk.Label(self.control_frame, text="Ready", foreground="blue")
-        self.status_label.grid(row=2, column=0, columnspan=4, pady=5)
+        self.status_label = ttk.Label(self.main_container, text="Ready")
+        self.status_label.pack(fill=tk.X, pady=(0, 5))
         
-        # Create notebook with specific size to fill remaining space
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # Create notebook with fixed height ratio
+        self.notebook = ttk.Notebook(self.main_container)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
         
-        # Create main frames for each tab
+        # Initialize tabs
+        self.setup_tabs()
+        
+        # Initialize canvases and outputs
+        self.initialize_canvases()
+
+    def setup_tabs(self):
+        # Create tabs with proper frame management
         self.lightcurve_tab = ttk.Frame(self.notebook)
         self.ttv_tab = ttk.Frame(self.notebook)
         self.centroid_tab = ttk.Frame(self.notebook)
         
-        # Add the main frames to the notebook
         self.notebook.add(self.lightcurve_tab, text="Light Curve")
         self.notebook.add(self.ttv_tab, text="TTV Analysis")
         self.notebook.add(self.centroid_tab, text="Centroid Analysis")
         
-        # Create plot frames and navigation controls for each tab
-        self.setup_tab(self.lightcurve_tab, 'lightcurve')
-        self.setup_tab(self.ttv_tab, 'ttv')
-        self.setup_tab(self.centroid_tab, 'centroid')
-        
-        # Initialize canvases
-        self.lightcurve_canvas = None
-        self.ttv_canvas = None
-        self.centroid_canvas = None
-        
-        # Initialize output tracking
-        self.current_outputs = {
-            'lightcurve': [],
-            'ttv': [],
-            'centroid': []
-        }
-        self.current_output_index = {
-            'lightcurve': 0,
-            'ttv': 0,
-            'centroid': 0
-        }
-        
+        # Setup each tab with proper frame management
+        self.setup_tab(self.lightcurve_tab, "lightcurve")
+        self.setup_tab(self.ttv_tab, "ttv")
+        self.setup_tab(self.centroid_tab, "centroid")
+
     def setup_tab(self, tab, name):
-        # Create frame for plot
-        plot_frame = ttk.Frame(tab)
-        plot_frame.pack(fill=tk.BOTH, expand=True)
+        # Create main container frame for the tab
+        main_frame = ttk.Frame(tab)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Create plot frame that will expand
+        plot_frame = ttk.Frame(main_frame)
+        plot_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         setattr(self, f'{name}_frame', plot_frame)
         
-        # Create frame for navigation at bottom
-        nav_frame = ttk.Frame(tab)
-        nav_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        # Create navigation frame with fixed height at bottom
+        nav_frame = ttk.Frame(main_frame, height=40)  # Reduced fixed height
+        nav_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(0, 5))
+        nav_frame.pack_propagate(False)  # Prevent frame from shrinking
         
-        # Add navigation controls
-        self.add_navigation_controls(nav_frame, name)
+        # Create button frame with grid for centering
+        button_frame = ttk.Frame(nav_frame)
+        button_frame.place(relx=0.5, rely=0.5, anchor='center')  # Center in nav_frame
+        
+        # New ordering: Previous, Next, Output label, Reset View.
+        prev_button = ttk.Button(button_frame, text="Previous", 
+                                 command=lambda: self.show_previous_output(name))
+        prev_button.pack(side=tk.LEFT, padx=5)
+        setattr(self, f'{name}_prev_button', prev_button)
+        
+        next_button = ttk.Button(button_frame, text="Next", 
+                                 command=lambda: self.show_next_output(name))
+        next_button.pack(side=tk.LEFT, padx=5)
+        setattr(self, f'{name}_next_button', next_button)
+        
+        output_label = ttk.Label(button_frame, text="Output 0 of 0")
+        output_label.pack(side=tk.LEFT, padx=10)
+        setattr(self, f'{name}_nav_label', output_label)
+        
+        reset_button = ttk.Button(button_frame, text="Reset View",
+                                  command=self.reset_view)
+        reset_button.pack(side=tk.LEFT, padx=5)
+        setattr(self, f'{name}_reset_button', reset_button)
+
+    def setup_file_input(self):
+        # Add file load controls
+        ttk.Label(self.input_frame, text="Load Local File:").grid(row=0, column=0, padx=5, pady=5)
+        self.file_entry = ttk.Entry(self.input_frame, width=40)
+        self.file_entry.grid(row=0, column=1, padx=5, pady=5)
+        self.browse_button = ttk.Button(self.input_frame, text="Browse", command=self.browse_file)
+        self.browse_button.grid(row=0, column=2, padx=5, pady=5)
+        self.load_button = ttk.Button(self.input_frame, text="Load", command=self.load_local_file)
+        self.load_button.grid(row=0, column=3, padx=5, pady=5)
+
+    def setup_tic_search(self):
+        # Add TIC ID controls
+        ttk.Label(self.input_frame, text="Search by TIC ID:").grid(row=1, column=0, padx=5, pady=5)
+        self.tic_entry = ttk.Entry(self.input_frame, width=40)
+        self.tic_entry.grid(row=1, column=1, padx=5, pady=5)
+        self.search_button = ttk.Button(self.input_frame, text="Search & Download", command=self.search_tic)
+        self.search_button.grid(row=1, column=2, columnspan=2, padx=5, pady=5)
 
     def browse_file(self):
         from tkinter import filedialog
@@ -402,10 +319,18 @@ class TESSAnalyzerUI:
             self.status_label.config(text="Please select a file first", foreground="red")
             return
         
+        # Clear previous plots before loading new data
+        self.clear_all_plots()
+        
         self.status_label.config(text="Processing file...", foreground="blue")
         try:
-            process_tess_file(file_path, self)
-            self.status_label.config(text="File processed successfully", foreground="green")
+            tpf = lk.TessTargetPixelFile(file_path)
+            result = process_single_tpf_path(tpf.path)
+            if result is not None:
+                self.plot_results(result)
+                self.status_label.config(text="File processed successfully", foreground="green")
+            else:
+                self.status_label.config(text="File processing failed", foreground="red")
         except Exception as e:
             self.status_label.config(text=f"Error processing file: {str(e)}", foreground="red")
 
@@ -415,42 +340,28 @@ class TESSAnalyzerUI:
             self.status_label.config(text="Please enter a TIC ID", foreground="red")
             return
         
+        # Clear previous plots before loading new data
+        self.clear_all_plots()
+        
         self.status_label.config(text="Searching and downloading data...", foreground="blue")
         try:
             tpfs = search_and_download_tpf(tic_id)
             if tpfs is not None:
-                for tpf in tpfs:
-                    process_tess_file(tpf.path, self)
-                self.status_label.config(text=f"Downloaded and processed {len(tpfs)} files", foreground="green")
+                # Process files in parallel
+                results = process_tess_files_parallel(tpfs)
+                
+                # Plot results in the UI thread
+                for result in results:
+                    self.plot_results(result)
+                
+                self.status_label.config(
+                    text=f"Processed {len(results)} files successfully", 
+                    foreground="green"
+                )
             else:
                 self.status_label.config(text="No files found for this TIC ID", foreground="red")
         except Exception as e:
             self.status_label.config(text=f"Error processing TIC ID: {str(e)}", foreground="red")
-
-    def add_navigation_controls(self, parent, tab_name):
-        # Center the buttons
-        parent.grid_columnconfigure(0, weight=1)
-        
-        # Create a frame for the buttons
-        button_frame = ttk.Frame(parent)
-        button_frame.grid(row=0, column=0, pady=5)
-        
-        # Add Previous button
-        prev_button = ttk.Button(button_frame, text="Previous", 
-                               command=lambda: self.show_previous_output(tab_name))
-        prev_button.pack(side=tk.LEFT, padx=5)
-        setattr(self, f'{tab_name}_prev_button', prev_button)
-        
-        # Add output label
-        output_label = ttk.Label(button_frame, text="Output 0 of 0")
-        output_label.pack(side=tk.LEFT, padx=10)
-        setattr(self, f'{tab_name}_nav_label', output_label)
-        
-        # Add Next button
-        next_button = ttk.Button(button_frame, text="Next", 
-                               command=lambda: self.show_next_output(tab_name))
-        next_button.pack(side=tk.LEFT, padx=5)
-        setattr(self, f'{tab_name}_next_button', next_button)
 
     def show_previous_output(self, tab_name):
         if self.current_output_index[tab_name] > 0:
@@ -494,8 +405,8 @@ class TESSAnalyzerUI:
             self.lightcurve_canvas.get_tk_widget().destroy()
         
         # Create figure with adjusted size
-        fig = plt.figure(figsize=(10, 6))
-        ax = fig.add_subplot(111)
+        self.current_fig = plt.figure(figsize=(10, 6))
+        ax = self.current_fig.add_subplot(111)
         
         # Plot data
         folded_lc.scatter(ax=ax, c='black', s=2)
@@ -507,20 +418,194 @@ class TESSAnalyzerUI:
         ax.set_ylabel('Normalized Flux')
         ax.legend()
         
-        # Adjust layout
-        fig.tight_layout(pad=1.0)
+        # Store original view limits
+        self.original_xlim = ax.get_xlim()
+        self.original_ylim = ax.get_ylim()
         
         # Create and pack canvas
-        self.lightcurve_canvas = FigureCanvasTkAgg(fig, master=self.lightcurve_frame)
+        self.lightcurve_canvas = FigureCanvasTkAgg(self.current_fig, master=self.lightcurve_frame)
         self.lightcurve_canvas.draw()
         self.lightcurve_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         
-        # Store the figure and update display
-        self.current_outputs['lightcurve'].append(fig)
+        # Store the data and enable zoom
+        self.current_folded_lc = folded_lc
+        self.enable_zoom_selection(folded_lc)
+        
+        # Connect mouse events
+        self.lightcurve_canvas.mpl_connect('button_press_event', self.on_mouse_press)
+        self.lightcurve_canvas.mpl_connect('button_release_event', self.on_mouse_release)
+        self.lightcurve_canvas.mpl_connect('motion_notify_event', self.on_mouse_motion)
+        
+        # Update display
+        self.current_outputs['lightcurve'].append(self.current_fig)
         self.update_output_display('lightcurve')
-        plt.close(fig)
 
-    def plot_ttv(self, unique_epochs, deviations):
+    def enable_zoom_selection(self, folded_lc):
+        """Enable interactive zoom selection"""
+        # Create the selector with updated parameters
+        ax = self.current_fig.gca()
+        self.selector = RectangleSelector(
+            ax, self.zoom_selection_callback,
+            useblit=True,
+            button=[1],  # Left mouse button only
+            minspanx=5, minspany=5,
+            spancoords='pixels',
+            interactive=True,
+            props=dict(facecolor='red', edgecolor='red', alpha=0.2, fill=True)
+        )
+        
+        # Store the light curve data for the callback
+        self.zoom_folded_lc = folded_lc
+        
+        # Make sure the selector is active
+        self.selector.set_active(True)
+
+    def on_mouse_press(self, event):
+        if event.inaxes:
+            self.is_dragging = True
+            self.drag_start = (event.xdata, event.ydata)
+
+    def on_mouse_release(self, event):
+        if event.inaxes and self.is_dragging:
+            self.is_dragging = False
+            if hasattr(self, 'drag_start'):
+                end_point = (event.xdata, event.ydata)
+                # Clear any existing rectangle
+                if hasattr(self, 'rect_artist') and self.rect_artist is not None:
+                    self.rect_artist.remove()
+                    self.rect_artist = None
+                # Perform zoom and recalculation
+                self.zoom_selection_callback(self.drag_start, end_point)
+
+    def on_mouse_motion(self, event):
+        if event.inaxes and self.is_dragging:
+            ax = event.inaxes
+            
+            # Remove existing rectangle if it exists
+            if hasattr(self, 'rect_artist') and self.rect_artist is not None:
+                self.rect_artist.remove()
+            
+            # Draw new rectangle
+            x0, y0 = self.drag_start
+            x1, y1 = event.xdata, event.ydata
+            self.rect_artist = plt.Rectangle(
+                (min(x0, x1), min(y0, y1)), 
+                abs(x1 - x0), abs(y1 - y0),
+                fill=True, fc='red', ec='red', alpha=0.2
+            )
+            ax.add_patch(self.rect_artist)
+            self.lightcurve_canvas.draw()
+
+    def zoom_selection_callback(self, eclick, erelease):
+        """Handle zoom selection"""
+        try:
+            if isinstance(eclick, tuple):
+                x1, y1 = eclick
+                x2, y2 = erelease
+            else:
+                x1, y1 = eclick.xdata, eclick.ydata
+                x2, y2 = erelease.xdata, erelease.ydata
+            
+            # Get the selected region bounds
+            xmin, xmax = min(x1, x2), max(x1, x2)
+            ymin, ymax = min(y1, y2), max(y1, y2)
+            
+            # Filter data to selected region
+            mask = (self.zoom_folded_lc.time.value >= xmin) & \
+                   (self.zoom_folded_lc.time.value <= xmax) & \
+                   (self.zoom_folded_lc.flux.value >= ymin) & \
+                   (self.zoom_folded_lc.flux.value <= ymax)
+            
+            zoomed_lc = self.zoom_folded_lc[mask]
+            
+            # Check if we have enough points
+            if len(zoomed_lc) < 20:
+                self.status_label.config(text="Selected region too small. Need at least 20 points.", foreground="red")
+                return
+            
+            # Create new figure and axis
+            plt.close(self.current_fig)
+            self.current_fig = plt.figure(figsize=(10, 6))
+            ax = self.current_fig.add_subplot(111)
+            
+            # Recalculate analysis for zoomed region
+            window_size = max(20, len(zoomed_lc) // 10)  # Adjust window size for zoomed data
+            df = pd.DataFrame({'flux': zoomed_lc.flux})
+            moving_avg = df['flux'].rolling(window=window_size, center=True).mean()
+            
+            # Plot zoomed data with new calculations
+            zoomed_lc.scatter(ax=ax, c='black', s=2, label='Data')
+            ax.plot(zoomed_lc.time.value, moving_avg, color='red', label='Smoothed Moving Average')
+            
+            # Update labels and title
+            ax.set_title('Phase Folded Light Curve (Zoomed)')
+            ax.set_xlabel('Phase [days]')
+            ax.set_ylabel('Normalized Flux')
+            ax.legend()
+            
+            # Set the zoom limits with a small margin
+            margin = 0.1  # 10% margin
+            x_range = xmax - xmin
+            y_range = ymax - ymin
+            ax.set_xlim(xmin - margin * x_range, xmax + margin * x_range)
+            ax.set_ylim(ymin - margin * y_range, ymax + margin * y_range)
+            
+            # Recalculate SNR for zoomed region
+            snr = calculate_snr(zoomed_lc, self.zoom_folded_lc.period.value)
+            if snr is not None:
+                ax.set_title(f'Phase Folded Light Curve (Zoomed) - SNR: {snr:.2f}')
+                self.status_label.config(text=f"Zoomed region analyzed. SNR: {snr:.2f}", foreground="green")
+            
+            # Update the canvas while preserving button frame
+            if self.lightcurve_canvas:
+                self.lightcurve_canvas.get_tk_widget().destroy()
+            
+            self.lightcurve_canvas = FigureCanvasTkAgg(self.current_fig, master=self.lightcurve_frame)
+            self.lightcurve_canvas.draw()
+            self.lightcurve_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            
+            # Store the zoomed light curve for further zooming
+            self.zoom_folded_lc = zoomed_lc
+            
+            # Re-enable zoom selection for further zooming
+            self.enable_zoom_selection(zoomed_lc)
+            
+            # Connect the canvas to mouse events
+            self.lightcurve_canvas.mpl_connect('button_press_event', self.on_mouse_press)
+            self.lightcurve_canvas.mpl_connect('button_release_event', self.on_mouse_release)
+            self.lightcurve_canvas.mpl_connect('motion_notify_event', self.on_mouse_motion)
+            
+        except Exception as e:
+            print(f"Error in zoom selection: {e}")
+            self.status_label.config(text=f"Error in zoom selection: {str(e)}", foreground="red")
+
+    def reset_view(self):
+        """Reset to original view"""
+        if hasattr(self, 'original_xlim') and hasattr(self, 'original_ylim'):
+            ax = self.current_fig.gca()
+            ax.set_xlim(self.original_xlim)
+            ax.set_ylim(self.original_ylim)
+            
+            # Replot original data
+            ax.clear()
+            self.current_folded_lc.scatter(ax=ax, c='black', s=2)
+            
+            # Recalculate moving average for full dataset
+            df = pd.DataFrame({'flux': self.current_folded_lc.flux})
+            moving_avg = df['flux'].rolling(window=200, center=True).mean()
+            ax.plot(self.current_folded_lc.time.value, moving_avg, color='red', 
+                    label='Smoothed Moving Average')
+            
+            # Reset title and labels
+            ax.set_title('Phase Folded Light Curve')
+            ax.set_xlabel('Phase [days]')
+            ax.set_ylabel('Normalized Flux')
+            ax.legend()
+            
+            self.lightcurve_canvas.draw()
+            self.status_label.config(text="View reset to original", foreground="green")
+
+    def plot_ttv(self, folded_lc, period):
         if self.ttv_canvas:
             self.ttv_canvas.get_tk_widget().pack_forget()
         
@@ -529,10 +614,10 @@ class TESSAnalyzerUI:
         ax = fig.add_subplot(111)
         
         # Plot data
-        ax.plot(unique_epochs, deviations, 'o-', color='blue', markerfacecolor='red')
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('Transit Timing Deviation (days)')
-        ax.set_title('Transit Timing Variations (TTVs)')
+        ax.plot(folded_lc.time.value, folded_lc.flux.value, 'o-', color='blue', markerfacecolor='red')
+        ax.set_xlabel('Time (days)')
+        ax.set_ylabel('Normalized Flux')
+        ax.set_title('Transit Light Curve')
         ax.grid(True)
         
         # Adjust layout to fit in window
@@ -548,7 +633,7 @@ class TESSAnalyzerUI:
         self.update_output_display('ttv')
         plt.close(fig)
 
-    def plot_centroid(self, clipped_lc_time, centroid_col, centroid_row):
+    def plot_centroid(self, tpf, folded_lc):
         if self.centroid_canvas:
             self.centroid_canvas.get_tk_widget().pack_forget()
         
@@ -557,11 +642,10 @@ class TESSAnalyzerUI:
         ax = fig.add_subplot(111)
         
         # Plot data
-        ax.plot(clipped_lc_time, centroid_col, label='Centroid Column')
-        ax.plot(clipped_lc_time, centroid_row, label='Centroid Row')
-        ax.set_xlabel('Time (BTJD)')
-        ax.set_ylabel('Centroid Position (pixels)')
-        ax.set_title('Centroid Motion Over Time')
+        ax.plot(folded_lc.time.value, folded_lc.flux.value, label='Transit Light Curve')
+        ax.set_xlabel('Time (days)')
+        ax.set_ylabel('Normalized Flux')
+        ax.set_title('Transit Light Curve')
         ax.legend()
         
         # Adjust layout to fit in window
@@ -577,6 +661,204 @@ class TESSAnalyzerUI:
         self.update_output_display('centroid')
         plt.close(fig)
 
+    def plot_results(self, result):
+        if result is not None:
+            # Load TPF for plotting when needed
+            tpf = lk.TessTargetPixelFile(result['tpf_path'])
+            
+            self.plot_lightcurve(result['folded_lc'], result['moving_avg'])
+            self.plot_ttv(result['folded_lc'], result['period'])
+            self.plot_centroid(tpf, result['folded_lc'])
+
+    def clear_all_plots(self):
+        # Clear all stored outputs
+        self.current_outputs = {
+            'lightcurve': [],
+            'ttv': [],
+            'centroid': []
+        }
+        self.current_output_index = {
+            'lightcurve': 0,
+            'ttv': 0,
+            'centroid': 0
+        }
+        
+        # Clear all canvases
+        if self.lightcurve_canvas:
+            self.lightcurve_canvas.get_tk_widget().destroy()
+            self.lightcurve_canvas = None
+        if self.ttv_canvas:
+            self.ttv_canvas.get_tk_widget().destroy()
+            self.ttv_canvas = None
+        if self.centroid_canvas:
+            self.centroid_canvas.get_tk_widget().destroy()
+            self.centroid_canvas = None
+            
+        # Reset navigation labels
+        for tab_name in ['lightcurve', 'ttv', 'centroid']:
+            label = getattr(self, f'{tab_name}_nav_label')
+            label.config(text="Output 0 of 0")
+            
+            # Reset button states
+            prev_button = getattr(self, f'{tab_name}_prev_button')
+            next_button = getattr(self, f'{tab_name}_next_button')
+            prev_button.config(state='disabled')
+            next_button.config(state='disabled')
+
+    def add_analysis_features(self):
+        """
+        Add new analysis features to UI
+        """
+        # Add new analysis tab
+        self.analysis_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.analysis_tab, text="Advanced Analysis")
+        
+        # Add parameter display
+        self.param_frame = ttk.LabelFrame(self.analysis_tab, text="Transit Parameters")
+        self.param_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Add false positive indicators
+        self.fp_frame = ttk.LabelFrame(self.analysis_tab, text="False Positive Checks")
+        self.fp_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Add statistical results
+        self.stats_frame = ttk.LabelFrame(self.analysis_tab, text="Statistical Analysis")
+        self.stats_frame.pack(fill=tk.X, padx=5, pady=5)
+
+    def initialize_canvases(self):
+        """Initialize canvas attributes and output tracking"""
+        # Initialize canvas objects
+        self.lightcurve_canvas = None
+        self.ttv_canvas = None
+        self.centroid_canvas = None
+        
+        # Initialize output tracking
+        self.current_outputs = {
+            'lightcurve': [],
+            'ttv': [],
+            'centroid': []
+        }
+        self.current_output_index = {
+            'lightcurve': 0,
+            'ttv': 0,
+            'centroid': 0
+        }
+
+
+def process_tess_files_parallel(tpfs, use_tls=True):
+    try:
+        # Reduce number of cores for more stable processing
+        num_cores = min(8, mp.cpu_count() - 16)
+        print(f"\nUsing {num_cores} cores for processing")
+        print(f"Total files to process: {len(tpfs)}")
+        
+        # Convert TPFs to paths for multiprocessing
+        tpf_paths = [tpf.path for tpf in tpfs]
+        
+        # Pass the use_tls flag to each processing call
+        with mp.Pool(num_cores) as pool:
+            results = pool.map(partial(process_single_tpf_path, use_tls=use_tls), tpf_paths)
+            
+        successful = [r for r in results if r is not None]
+        failed = len(results) - len(successful)
+        
+        print(f"\nProcessing Summary:")
+        print(f"Total files: {len(results)}")
+        print(f"Successful: {len(successful)}")
+        print(f"Failed: {failed}")
+        
+        return successful
+        
+    except Exception as e:
+        print(f"Error in parallel processing: {e}")
+        return []
+
+def process_single_tpf_path(tpf_path, use_tls=True):
+    try:
+        print(f"\nProcessing: {tpf_path}")
+        # Load TPF from path
+        tpf = lk.TessTargetPixelFile(tpf_path)
+        plt.close('all')
+        
+        # Generate the light curve using the pipeline mask
+        lc = tpf.to_lightcurve(aperture_mask=tpf.pipeline_mask)
+        print("Generated light curve")
+
+        # Flatten the light curve to remove long-term trends
+        flat_lc = lc.flatten()
+        print("Flattened light curve")
+
+        # Perform sigma clipping to remove outliers
+        clipped_lc = flat_lc[sigma_clip(flat_lc.flux, sigma=5).mask == False]
+        print("Performed sigma clipping")
+
+        # Compute moving average
+        window_size = 200
+        df = pd.DataFrame({'flux': clipped_lc.flux})
+        moving_avg = df['flux'].rolling(window=window_size, center=True).mean()
+        print("Computed moving average")
+
+        # Search for transits using BLS
+        period = np.linspace(0.5, 10, 10000)
+        bls = clipped_lc.to_periodogram(method='bls', period=period, frequency_factor=500)
+        print("Completed BLS search")
+
+        # Extract period information
+        planet_x_period = bls.period_at_max_power
+        planet_x_t0 = bls.transit_time_at_max_power.value
+
+        # Fold the light curve
+        folded_lc = clipped_lc.fold(period=planet_x_period, epoch_time=planet_x_t0)
+        print("Folded light curve")
+        
+        # Check SNR before continuing
+        snr = calculate_snr(folded_lc, planet_x_period.value)
+        print(f"SNR calculated: {snr}")
+        
+        # Remove SNR filtering temporarily to see all results
+        # if snr is None or snr < 1.0:
+        #     print(f"Skipping {tpf_path} due to low SNR")
+        #     return None
+
+        # Return the processed data without the TPF object
+        return {
+            'folded_lc': folded_lc,
+            'moving_avg': moving_avg,
+            'period': float(planet_x_period.value),
+            'epoch': float(planet_x_t0),
+            'tpf_path': tpf_path,
+            'snr': snr
+        }
+
+    except Exception as e:
+        print(f"Error processing {tpf_path}: {str(e)}")
+        return None
+    finally:
+        plt.close('all')
+
+
+def enhanced_transit_detection(folded_lc, period):
+    """
+    Improved transit detection with multiple methods
+    """
+    # BLS with multiple period ranges
+    period_ranges = [
+        (0.5, 5),    # Short period planets
+        (5, 15),     # Medium period planets
+        (15, 30)     # Longer period planets
+    ]
+    
+    results = []
+    for p_min, p_max in period_ranges:
+        period = np.linspace(p_min, p_max, 10000)
+        bls = folded_lc.to_periodogram(method='bls', period=period, frequency_factor=500)
+        results.append({
+            'period': bls.period_at_max_power,
+            'power': bls.max_power,
+            'range': (p_min, p_max)
+        })
+    
+    return results
 
 
 if __name__ == "__main__":
